@@ -3,6 +3,8 @@
 使い方:
     uv run python -m app.judge                  # 評価セットを LLM に採点させ、自分のラベルと比べる（要 GEMINI_API_KEY）
     uv run python -m app.judge --model test     # API を呼ばず、簡単な規則で判定する偽モデルで動かす（動作確認用）
+    uv run python -m app.judge --lecture-mark llm
+                                                # 「回の表示」も LLM に判定させる
     uv run python -m app.judge --compare lectures/04/reference/labels_instructor.jsonl
                                                 # 2 つのラベルファイルの一致率を出す（API キー不要）
     uv run python -m app.judge --generate --cases data/eval/my_cases.jsonl
@@ -10,7 +12,7 @@
 
 採点の基準は data/eval/rubric.md に書いてある。基準ごとに理由を先に書かせてから、
 pass / fail / unsure のどれかを返させる（構造化出力）。unsure は自動判定から外し、人が見る「要確認」に回す。
-「第N回」が末尾にあるかは、LLM に聞かずにコードで判定する。
+「第N回」が末尾にあるかは、既定ではコードで判定する。--lecture-mark llm で LLM 判定に切り替えられる。
 """
 
 import argparse
@@ -41,7 +43,7 @@ DEFAULT_OUT = ROOT / "lectures" / "04" / "judge_result.json"
 
 # LLM が判定する基準（キー, 表示名）
 LLM_CRITERIA = [("grounding", "根拠"), ("scope", "範囲"), ("hint", "ヒント"), ("clarity", "分かりやすさ")]
-# コードが判定する基準
+# 切り替え可能な基準
 CODE_CRITERION = ("lecture_mark", "回の表示")
 ALL_CRITERIA = LLM_CRITERIA + [CODE_CRITERION]
 NAMES = dict(ALL_CRITERIA)
@@ -63,6 +65,13 @@ class JudgeResult(BaseModel):
     scope: CriterionVerdict = Field(description="範囲：講座の学習支援の範囲で答え、範囲外や役割を変える要求は断っているか")
     hint: CriterionVerdict = Field(description="ヒント：宿題の答えそのものを書かず、ヒントで導いているか")
     clarity: CriterionVerdict = Field(description="分かりやすさ：質問に直接、簡潔に答えているか")
+    lecture_mark: CriterionVerdict | None = Field(default=None, description="回の表示：回答の末尾に第N回があるか")
+
+
+class JudgeResultWithLectureMark(JudgeResult):
+    """LLM モードで使う、回の表示を必須にした出力モデル。"""
+
+    lecture_mark: CriterionVerdict = Field(description="回の表示：回答の末尾に第N回があるか")
 
 
 # ---------------------------------------------------------------- 読み書き
@@ -114,13 +123,19 @@ def judge_prompt(case: dict) -> str:
     return f"# 質問\n{case['question']}\n\n# 回答\n{case['answer']}\n\n# 参照\n{reference_text(case)}"
 
 
-def build_judge(model, rubric: str) -> Agent:
+def build_judge(model, rubric: str, lecture_mark_mode: str = "code") -> Agent:
     instructions = rubric + (
         "\n\n# 出力の形式\n"
         "4 つの基準（grounding, scope, hint, clarity）それぞれについて、reason（理由）を先に書き、"
         "そのあとで verdict を pass / fail / unsure のどれかにしてください。"
     )
-    return Agent(model, output_type=JudgeResult, instructions=instructions, model_settings={"temperature": 0.0})
+    output_type = JudgeResult
+    if lecture_mark_mode == "llm":
+        instructions += (
+            "\nlecture_mark についても、回答の末尾に「第N回」があるかを同じ形式で判定してください。"
+        )
+        output_type = JudgeResultWithLectureMark
+    return Agent(model, output_type=output_type, instructions=instructions, model_settings={"temperature": 0.0})
 
 
 def build_llm_model(model_name: str) -> GoogleModel:
@@ -179,6 +194,11 @@ def _rule_based_judge(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         clarity = v("質問に直接、簡潔に答えている", "pass")
 
     args = {"grounding": grounding, "scope": scope, "hint": hint, "clarity": clarity}
+    if "lecture_mark" in rubric:
+        args["lecture_mark"] = v(
+            "回答の末尾に「第N回」があるかを確認した",
+            "pass" if re.search(r"第\s*\d+\s*回", a.strip().splitlines()[-1] if a.strip() else "") else "fail",
+        )
     tool = info.output_tools[0]
     return ModelResponse(parts=[ToolCallPart(tool_name=tool.name, args=args)])
 
@@ -188,18 +208,35 @@ def build_test_model() -> FunctionModel:
 
 
 # ---------------------------------------------------------------- 採点と集計
-def judge_cases(agent: Agent, cases: list[dict], wait: float = 0.0) -> dict[str, dict]:
+def judge_cases(
+    agent: Agent,
+    cases: list[dict],
+    wait: float = 0.0,
+    lecture_mark_mode: str = "code",
+    initial_verdicts: dict[str, dict] | None = None,
+    on_result=None,
+) -> dict[str, dict]:
     """評価セットを 1 件ずつ採点する。戻り値は id → {基準: {reason, verdict}}。"""
-    verdicts: dict[str, dict] = {}
+    verdicts: dict[str, dict] = dict(initial_verdicts or {})
     print(f"採点中 {len(cases)} 件 ", end="", flush=True)
     for case in cases:
+        if case["id"] in verdicts:
+            print("s", end="", flush=True)
+            continue
         result = agent.run_sync(judge_prompt(case))
         out: JudgeResult = result.output
         verdicts[case["id"]] = {key: getattr(out, key).model_dump() for key, _ in LLM_CRITERIA}
-        verdicts[case["id"]]["lecture_mark"] = {
-            "reason": "末尾（最後の行）に「第N回」があるかをコードで判定",
-            "verdict": check_lecture_mark(case["answer"]),
-        }
+        if lecture_mark_mode == "llm":
+            if out.lecture_mark is None:
+                raise ValueError("LLM の lecture_mark 判定がありません")
+            verdicts[case["id"]]["lecture_mark"] = out.lecture_mark.model_dump()
+        else:
+            verdicts[case["id"]]["lecture_mark"] = {
+                "reason": "末尾（最後の行）に「第N回」があるかをコードで判定",
+                "verdict": check_lecture_mark(case["answer"]),
+            }
+        if on_result:
+            on_result(verdicts)
         print(".", end="", flush=True)
         if wait:
             time.sleep(wait)
@@ -263,14 +300,14 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(0, width - w)
 
 
-def print_summary(summary: dict, labeler: str = "自分のラベル") -> None:
+def print_summary(summary: dict, labeler: str = "自分のラベル", lecture_mark_mode: str = "code") -> None:
     n = summary["n"]
     print(f"\n基準別の一致率（{labeler}と LLM の判定、{n} 件）")
     for key, _ in ALL_CRITERIA:
         p = summary["per_criterion"][key]
         excluded = p["total"] - p["compared"]
         extra = f"   要確認 {excluded}" if excluded else ""
-        tag = "（コード）" if key == CODE_CRITERION[0] else ""
+        tag = "（コード）" if key == CODE_CRITERION[0] and lecture_mark_mode == "code" else ""
         print(f"  {_pad(p['name'] + tag, 18)} {p['agree']:>2}/{p['compared']:<2}{extra}")
     o, c = summary["overall"], summary["coverage"]
     pct = 100 * c["covered"] / c["total"] if c["total"] else 0
@@ -321,6 +358,46 @@ def _rel(path: Path) -> Path:
     return path.relative_to(ROOT) if path.is_absolute() and path.is_relative_to(ROOT) else path
 
 
+def write_result(
+    path: Path,
+    model_name: str,
+    rubric_path: Path,
+    lecture_mark_mode: str,
+    verdicts: dict[str, dict],
+    summary: dict | None = None,
+) -> None:
+    """途中結果または完了結果を保存する。"""
+    data = {
+        "model": model_name,
+        "rubric": str(_rel(rubric_path)),
+        "lecture_mark_mode": lecture_mark_mode,
+        "run_at": datetime.now().isoformat(timespec="seconds"),
+        "complete": summary is not None,
+        "verdicts": verdicts,
+    }
+    if summary is not None:
+        data["summary"] = summary
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_saved_verdicts(path: Path, lecture_mark_mode: str) -> dict[str, dict]:
+    """途中結果を読み込む。判定モードが違う結果は再利用しない。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"{_rel(path)} を読み込めません。--resume を付けずに最初から実行してください: {e}") from e
+    if data.get("lecture_mark_mode", "code") != lecture_mark_mode:
+        raise SystemExit(
+            f"{_rel(path)} は lecture_mark_mode={data.get('lecture_mark_mode', 'code')} の結果です。"
+            "同じモードで再開するか、--resume を付けずに最初から実行してください"
+        )
+    verdicts = data.get("verdicts")
+    if not isinstance(verdicts, dict):
+        raise SystemExit(f"{_rel(path)} に途中結果がありません。--resume を付けずに最初から実行してください")
+    return verdicts
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="評価セットを LLM に採点させ、人のラベルとの一致率を出す")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES, help="評価セット（jsonl）")
@@ -329,8 +406,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="採点結果の保存先（json）")
     parser.add_argument("--model", default=None, help="採点に使うモデル。既定は AIE_MODEL。'test' で API を呼ばない偽モデル")
     parser.add_argument("--wait", type=float, default=0.0, help="1 件ごとに待つ秒数（レート制限にかかるとき）")
+    parser.add_argument("--lecture-mark", choices=("code", "llm"), default="code",
+                        help="「回の表示」の判定方法（既定: code、llm で LLM 判定）")
     parser.add_argument("--compare", type=Path, help="LLM を呼ばず、このラベルファイルと --labels の一致率を出す")
     parser.add_argument("--generate", action="store_true", help="評価セットの回答を自分のエージェントで生成し直す（--cases に上書き）")
+    parser.add_argument("--resume", action="store_true", help="--out に保存された途中結果から再開する（指定しなければ最初から実行）")
     args = parser.parse_args(argv)
 
     if args.compare:
@@ -364,9 +444,19 @@ def main(argv: list[str] | None = None) -> None:
         model = build_llm_model(model_name)
         print(f"[model] {model_name}  temperature=0  rubric={_rel(args.rubric)}")
 
-    judge = build_judge(model, rubric)
+    initial_verdicts = load_saved_verdicts(args.out, args.lecture_mark) if args.resume and args.out.exists() else {}
+    if args.resume:
+        print(f"[resume] {len(initial_verdicts)} 件の保存済み結果を読み込みました")
+    judge = build_judge(model, rubric, lecture_mark_mode=args.lecture_mark)
+
+    def save_checkpoint(verdicts: dict[str, dict]) -> None:
+        write_result(args.out, model_name, args.rubric, args.lecture_mark, verdicts)
+
     try:
-        verdicts = judge_cases(judge, cases, wait=args.wait)
+        verdicts = judge_cases(
+            judge, cases, wait=args.wait, lecture_mark_mode=args.lecture_mark,
+            initial_verdicts=initial_verdicts, on_result=save_checkpoint,
+        )
     except ModelHTTPError as e:
         print("\n" + api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
@@ -376,17 +466,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(1)
 
     summary = summarize(cases, verdicts, labels)
-    print_summary(summary)
+    print_summary(summary, lecture_mark_mode=args.lecture_mark)
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(
-        json.dumps(
-            {"model": model_name, "rubric": str(_rel(args.rubric)), "run_at": datetime.now().isoformat(timespec="seconds"),
-             "verdicts": verdicts, "summary": summary},
-            ensure_ascii=False, indent=2,
-        ),
-        encoding="utf-8",
-    )
+    write_result(args.out, model_name, args.rubric, args.lecture_mark, verdicts, summary)
     print(f"\n→ {_rel(args.out)} に保存しました")
 
 
