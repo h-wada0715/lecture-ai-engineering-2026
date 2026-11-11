@@ -17,6 +17,8 @@ from app.judge import (
     overall,
     read_jsonl,
     summarize,
+    load_saved_verdicts,
+    write_result,
 )
 
 INSTRUCTOR_LABELS = judge.ROOT / "lectures" / "04" / "reference" / "labels_instructor.jsonl"
@@ -68,3 +70,22 @@ def test_judge_pipeline_with_fake_model():
     assert summary["coverage"]["covered"] + len({r["id"] for r in summary["review"]}) == 10
     for m in summary["mismatches"]:
         assert m["kind"] in ("見逃し", "過検出")
+
+
+def test_lecture_mark_can_be_judged_by_llm():
+    cases = read_jsonl(DEFAULT_CASES)
+    agent = build_judge(build_test_model(), DEFAULT_RUBRIC.read_text(encoding="utf-8"), lecture_mark_mode="llm")
+
+    verdicts = judge_cases(agent, cases, lecture_mark_mode="llm")
+
+    assert all(v["lecture_mark"]["reason"] for v in verdicts.values())
+    assert all(v["lecture_mark"]["verdict"] in ("pass", "fail", "unsure") for v in verdicts.values())
+
+
+def test_saved_verdicts_can_be_loaded_for_resume(tmp_path):
+    verdicts = {"01": {"grounding": {"verdict": "pass"}}}
+    result_path = tmp_path / "judge_result.json"
+
+    write_result(result_path, "test", DEFAULT_RUBRIC, "llm", verdicts)
+
+    assert load_saved_verdicts(result_path, "llm") == verdicts
